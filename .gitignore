@@ -1,0 +1,8 @@
+venv/
+venv_backup_*/
+venv_old_*/
+pycache/venv/
+venv_backup_*/
+venv_old_*/
+pycache/
+.DS_Store
