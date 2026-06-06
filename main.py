@@ -59,7 +59,9 @@ except Exception as e:
         else:
             error_details = f"Qt библиотека не найдена. Ошибки: {e} {e2}"
             print(error_details, file=sys.stderr)
-            sys.exit(1)
+            # Не прерываем выполнение при импорте модуля, чтобы можно было
+            # использовать утилитарные функции (например, ExcelCleaner) в тестах.
+            qt_backend = None
 
 if missing and not is_pyinstaller:
     msg = f"Отсутствуют зависимости: {chr(10).join(missing)} Установите через: pip install -r requirements.txt"
@@ -275,6 +277,39 @@ class ExcelCleaner:
         return cleaned
 
     @staticmethod
+    def convert_numeric_columns(df, columns=None):
+        import pandas as pd
+        if columns is None:
+            columns = ['Кол-во', 'Цена', 'Сумма', 'Артикул']
+        cols = [c for c in columns if c in df.columns]
+        for col in cols:
+            try:
+                s = df[col].astype(str).str.strip().replace('', pd.NA)
+                s = s.str.replace(' ', '')
+                # Обрабатывать разные форматы: если в строке есть и ',' и '.',
+                # то скорее всего ',' — разделитель тысяч (удаляем), '.' — десятичный.
+                def _normalize(x):
+                    if x is None:
+                        return x
+                    xs = str(x)
+                    if ',' in xs and '.' in xs:
+                        return xs.replace(',', '')
+                    if ',' in xs:
+                        return xs.replace(',', '.')
+                    return xs
+
+                s = s.apply(_normalize)
+                conv = pd.to_numeric(s, errors='coerce')
+                if conv.notna().any():
+                    mask = conv.notna()
+                    # Переводим столбец в object, чтобы можно было записать числа
+                    df[col] = df[col].astype(object)
+                    df.loc[mask, col] = conv[mask]
+            except Exception:
+                pass
+        return df
+
+    @staticmethod
     def remove_empty_rows_and_columns(file_path: str, dest_path: str) -> tuple[bool, str]:
         try:
             import pandas as pd
@@ -294,9 +329,12 @@ class ExcelCleaner:
                 raw = raw.fillna('').astype(str)
                 cleaned = ExcelCleaner.clean_dataframe(raw)
 
+                # Целевое приведение колонок, чтобы числа писались в Excel как числовые ячейки.
+                cleaned = ExcelCleaner.convert_numeric_columns(cleaned)
+
                 for r_idx, row in enumerate(cleaned.values, 1):
                     for c_idx, val in enumerate(row, 1):
-                        ws.cell(row=r_idx, column=c_idx, value=str(val))
+                        ws.cell(row=r_idx, column=c_idx, value=val)
                 wb.save(dest_path)
 
             elif ext in ('.xls', '.xlsx'):
@@ -326,9 +364,11 @@ class ExcelCleaner:
                     if hasattr(current_ws, 'views') and current_ws.views.sheetView:
                         current_ws.views.sheetView[0].showGridLines = True
 
+                    cleaned = ExcelCleaner.convert_numeric_columns(cleaned)
+
                     for r_idx, row in enumerate(cleaned.values, 1):
                         for c_idx, val in enumerate(row, 1):
-                            current_ws.cell(row=r_idx, column=c_idx, value=str(val))
+                            current_ws.cell(row=r_idx, column=c_idx, value=val)
 
                 wb.save(dest_path)
             else:
