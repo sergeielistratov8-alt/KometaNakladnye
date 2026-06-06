@@ -18,7 +18,6 @@ except Exception:
 
 # Определяем, запущено ли приложение через PyInstaller
 is_pyinstaller = getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
-is_pyinstaller = True
 
 # Проверка наличия критичных зависимостей
 missing = []
@@ -139,6 +138,36 @@ class ExcelCleaner:
     FOOTER_KEYWORDS = ['итого', 'итого:', 'в том числе', 'ндс', 'налог']
 
     @staticmethod
+    def is_processable_filename(name: str) -> bool:
+        return not name.startswith('._') and not name.startswith('~$')
+
+    @staticmethod
+    def sanitize_sheet_name(name: str) -> str:
+        import re
+        cleaned = re.sub(r'[\\/*?:\[\]]', '_', str(name).strip())
+        return (cleaned[:31] if cleaned else 'Sheet')
+
+    @staticmethod
+    def read_csv_file(file_path: str):
+        import pandas as pd
+        encodings = ('utf-8-sig', 'utf-8', 'cp1251')
+        last_error = None
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    sample = f.read(4096)
+                if not sample.strip():
+                    return pd.DataFrame()
+                sep = ';' if sample.count(';') >= sample.count(',') else ','
+                return pd.read_csv(
+                    file_path, header=None, dtype=str, keep_default_na=False,
+                    encoding=encoding, sep=sep,
+                )
+            except Exception as e:
+                last_error = e
+        raise last_error or ValueError('Не удалось прочитать CSV')
+
+    @staticmethod
     def normalize_header_value(value: str) -> str:
         if value is None:
             return ''
@@ -231,7 +260,7 @@ class ExcelCleaner:
         cleaned = ExcelCleaner.remove_footer_rows(df.copy())
         cleaned = cleaned.iloc[:, :5]
         cleaned.columns = ExcelCleaner.TARGET_COLUMNS
-        cleaned = cleaned.replace(r'^s*$', pd.NA, regex=True)
+        cleaned = cleaned.replace(r'^\s*$', pd.NA, regex=True)
         cleaned = cleaned.dropna(axis=0, how='all', subset=ExcelCleaner.TARGET_COLUMNS).fillna('')
         return cleaned
 
@@ -253,7 +282,7 @@ class ExcelCleaner:
                 if canonical not in cleaned.columns:
                     cleaned[canonical] = ''
             cleaned = cleaned[ExcelCleaner.TARGET_COLUMNS]
-            cleaned = cleaned.replace(r'^s*$', pd.NA, regex=True)
+            cleaned = cleaned.replace(r'^\s*$', pd.NA, regex=True)
             cleaned = cleaned.dropna(axis=0, how='all', subset=ExcelCleaner.TARGET_COLUMNS)
             cleaned = ExcelCleaner.remove_footer_rows(cleaned)
             cleaned = ExcelCleaner.drop_footer_rows(cleaned)
@@ -264,13 +293,13 @@ class ExcelCleaner:
         if not positional.empty:
             return positional
 
-        cleaned = df.replace(r'^s*$', pd.NA, regex=True).dropna(axis=0, how='all').dropna(axis=1, how='all')
+        cleaned = df.replace(r'^\s*$', pd.NA, regex=True).dropna(axis=0, how='all').dropna(axis=1, how='all')
         cleaned.columns = [ExcelCleaner.normalize_header_value(col) for col in cleaned.columns]
         for canonical in ExcelCleaner.TARGET_COLUMNS:
             if canonical not in cleaned.columns:
                 cleaned[canonical] = ''
         cleaned = cleaned[ExcelCleaner.TARGET_COLUMNS]
-        cleaned = cleaned.replace(r'^s*$', pd.NA, regex=True).dropna(axis=0, how='all', subset=ExcelCleaner.TARGET_COLUMNS)
+        cleaned = cleaned.replace(r'^\s*$', pd.NA, regex=True).dropna(axis=0, how='all', subset=ExcelCleaner.TARGET_COLUMNS)
         cleaned = ExcelCleaner.remove_footer_rows(cleaned)
         cleaned = ExcelCleaner.drop_footer_rows(cleaned)
         cleaned = cleaned.fillna('')
@@ -325,7 +354,7 @@ class ExcelCleaner:
                 ws.views.sheetView[0].showGridLines = True
 
             if ext == '.csv':
-                raw = pd.read_csv(file_path, header=None, dtype=str, keep_default_na=False)
+                raw = ExcelCleaner.read_csv_file(file_path)
                 raw = raw.fillna('').astype(str)
                 cleaned = ExcelCleaner.clean_dataframe(raw)
 
@@ -354,10 +383,10 @@ class ExcelCleaner:
                     if first_sheet:
                         current_ws = ws
                         if sheet_name:
-                            current_ws.title = str(sheet_name)[:31]
+                            current_ws.title = ExcelCleaner.sanitize_sheet_name(sheet_name)
                         first_sheet = False
                     else:
-                        safe_name = str(sheet_name)[:31] if sheet_name else f"Sheet_{len(wb.sheetnames)+1}"
+                        safe_name = ExcelCleaner.sanitize_sheet_name(sheet_name) if sheet_name else f"Sheet_{len(wb.sheetnames)+1}"
                         current_ws = wb.create_sheet(title=safe_name)
 
                     current_ws.sheet_state = 'visible'
@@ -525,7 +554,8 @@ class ExcelCleanerUI(QMainWindow):
         files = []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if Path(path).suffix.lower() in ['.xlsx', '.xls', '.csv']:
+            p = Path(path)
+            if p.suffix.lower() in ['.xlsx', '.xls', '.csv'] and ExcelCleaner.is_processable_filename(p.name):
                 files.append(path)
         if files:
             self.add_files_to_input(files)
@@ -574,7 +604,7 @@ class ExcelCleanerUI(QMainWindow):
         self.files_to_process = []
         for file_path in Path(source).iterdir():
             if file_path.is_file() and file_path.suffix.lower() in ['.xlsx', '.xls', '.csv']:
-                if not file_path.name.startswith('._'):
+                if ExcelCleaner.is_processable_filename(file_path.name):
                     self.files_to_process.append(str(file_path))
         self.update_input_list()
 
@@ -593,7 +623,10 @@ class ExcelCleanerUI(QMainWindow):
 
     def add_files_to_input(self, files: list):
         for file_path in files:
-            if file_path not in self.files_to_process: self.files_to_process.append(file_path)
+            if not ExcelCleaner.is_processable_filename(Path(file_path).name):
+                continue
+            if file_path not in self.files_to_process:
+                self.files_to_process.append(file_path)
         self.update_input_list()
 
     def remove_selected_files(self):
@@ -608,20 +641,31 @@ class ExcelCleanerUI(QMainWindow):
 
     def unload_ready(self):
         dest_folder = Path(self.config.get("dest_folder", str(self.ready_dir)))
-        if not dest_folder.exists(): return
+        if not dest_folder.exists():
+            return
         import shutil
         moved = 0
+        errors = []
         for fname in list(self.processed_files):
             src = self.staging_dir / fname
-            if src.exists():
-                try:
-                    shutil.move(str(src), str(dest_folder / fname))
-                    moved += 1
-                except: pass
+            dest = dest_folder / fname
+            if not src.exists():
+                errors.append(f"{fname}: файл не найден")
+                continue
+            try:
+                if dest.exists():
+                    dest.unlink()
+                shutil.move(str(src), str(dest))
+                moved += 1
+            except Exception as e:
+                errors.append(f"{fname}: {e}")
         self.files_to_process, self.processed_files = [], []
         self.input_list.clear()
         self.output_list.clear()
-        QMessageBox.information(self, "Выгружено", f"Перемещено {moved} файлов.")
+        msg = f"Перемещено {moved} файлов."
+        if errors:
+            msg += "\n\nОшибки:\n" + "\n".join(errors)
+        QMessageBox.information(self, "Выгружено", msg)
 
     def start_processing(self):
         if not self.files_to_process: return
