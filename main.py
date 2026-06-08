@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from threading import Lock
+from PyQt5.QtCore import QObject
 
 # ГЛОБАЛЬНЫЕ ИМПОРТЫ ДЛЯ СТАТИЧЕСКИХ МЕТОДОВ
 try:
@@ -101,8 +102,7 @@ class FileProcessor(QObject):
                 file_p = Path(file_path)
                 file_name = file_p.name
 
-                # Читаем и чистим исходник один раз, затем сохраняем во все
-                # нужные форматы (по умолчанию .csv и .xlsx).
+                # Читаем и чистим исходник один раз, сохраняем в .xls.
                 combined, error_msg = ExcelCleaner.build_cleaned_dataframe(str(file_p))
                 if combined is None:
                     self.file_processed.emit(file_name, f'❌ {error_msg}')
@@ -112,13 +112,6 @@ class FileProcessor(QObject):
                         dest_path = Path(self.staging_dir) / dest_name
                         try:
                             ExcelCleaner.save_dataframe(combined, str(dest_path))
-                            # Форматирование (рамки/ширины) применимо только к
-                            # Excel; к CSV не добавляем, чтобы не плодить метаданные.
-                            if fmt == '.xlsx':
-                                try:
-                                    ExcelCleaner.apply_formatting(str(dest_path))
-                                except Exception:
-                                    pass
                             self.file_processed.emit(dest_name, '✅ Обработан')
                         except Exception as e:
                             self.file_processed.emit(dest_name, f'❌ {str(e)}')
@@ -139,14 +132,10 @@ class ExcelCleaner:
     }
     TARGET_COLUMNS = ['Артикул', 'Товар', 'Кол-во', 'Цена', 'Сумма']
     FOOTER_KEYWORDS = ['итого', 'итого:', 'в том числе', 'ндс', 'налог']
-    # Колонки, которые при экспорте принудительно приводятся к числу.
-    # Артикул не трогаем: он может содержать буквы и ведущие нули.
-    NUMERIC_EXPORT_COLUMNS = ['Кол-во', 'Цена', 'Сумма']
-    # Форматы итогового файла. По умолчанию создаём СРАЗУ оба варианта,
-    # чтобы можно было импортировать тот, который примет 'Своя технология'
-    # (заранее проверить нет возможности). Оставьте в списке один формат,
-    # когда станет известно, какой именно нужен.
-    EXPORT_FORMATS = ['.csv', '.xlsx']
+    # Колонки, которые при экспорте принудительно приводятся к числу в Excel.
+    NUMERIC_EXPORT_COLUMNS = ['Артикул', 'Кол-во', 'Цена', 'Сумма']
+    INTEGER_EXPORT_COLUMNS = ['Артикул', 'Кол-во']
+    EXPORT_FORMATS = ['.xls']
 
     @staticmethod
     def is_processable_filename(name: str) -> bool:
@@ -360,10 +349,8 @@ class ExcelCleaner:
 
         1) Во ВСЕХ текстовых ячейках удаляет невидимые символы (\\xa0 и пр.)
            и крайние пробелы (внутренние пробелы в тексте сохраняются).
-        2) Для числовых колонок ('Кол-во', 'Цена', 'Сумма') дополнительно
-           удаляет все пробелы и неразрывные пробелы, приводит значения через
-           pd.to_numeric(errors='coerce') и затем .astype(float) — чтобы тип
-           данных гарантированно был числом (Number), а не текстом.
+        2) Для числовых колонок ('Артикул', 'Кол-во', 'Цена', 'Сумма') приводит
+           значения к числу, чтобы Excel видел тип Number, а не Text.
         """
         import pandas as pd
 
@@ -398,45 +385,130 @@ class ExcelCleaner:
             return text
 
         for col in ExcelCleaner.NUMERIC_EXPORT_COLUMNS:
-            if col in export_df.columns:
-                normalized = export_df[col].map(_normalize)
-                export_df[col] = pd.to_numeric(normalized, errors='coerce').astype(float)
+            if col not in export_df.columns:
+                continue
+            normalized = export_df[col].map(_normalize)
+            if col == 'Артикул':
+                def _artikul(value, raw_text):
+                    if raw_text == '':
+                        return ''
+                    num = pd.to_numeric(raw_text, errors='coerce')
+                    if pd.isna(num):
+                        return _strip_invisible(str(value)).strip()
+                    return int(num) if num == int(num) else float(num)
+                export_df[col] = [
+                    _artikul(v, n) for v, n in zip(export_df[col], normalized)
+                ]
+            else:
+                export_df[col] = pd.to_numeric(normalized, errors='coerce')
 
         return export_df
 
     @staticmethod
-    def save_dataframe(df, dest_path: str):
-        """Сохраняет DataFrame максимально совместимо, через pandas.
+    def coerce_to_excel_value(value, col_name: str):
+        """Возвращает значение для xlwt: число (int/float) или текст."""
+        import pandas as pd
+        import math
 
-        CSV  -> разделитель ';', кодировка 'utf-8-sig', index=False,
-                header=False, десятичный разделитель ',', перевод строки '\\r\\n'.
-        XLSX -> engine='openpyxl', index=False, header=False, без какого-либо
-                форматирования и лишних метаданных.
-        """
+        if col_name == 'Товар':
+            return str(value).strip() if value not in (None, '') else '', 'text'
+
+        if value is None or value == '':
+            return '', 'empty'
+        if isinstance(value, float) and pd.isna(value):
+            return '', 'empty'
+
+        if isinstance(value, int):
+            return value, 'int'
+        if isinstance(value, float):
+            if col_name in ExcelCleaner.INTEGER_EXPORT_COLUMNS and value == int(value):
+                return int(value), 'int'
+            return value, 'float'
+
+        text = str(value).strip()
+        for ch in ExcelCleaner.INVISIBLE_CHARS:
+            text = text.replace(ch, '')
+        text = text.strip().replace(' ', '')
+        if not text or text.lower() in ('nan', 'none', '<na>'):
+            return '', 'empty'
+
+        if ',' in text and '.' in text:
+            text = text.replace(',', '')
+        elif ',' in text:
+            text = text.replace(',', '.')
+
+        try:
+            num = float(text)
+            if math.isfinite(num):
+                if col_name in ExcelCleaner.INTEGER_EXPORT_COLUMNS and num == int(num):
+                    return int(num), 'int'
+                return num, 'float'
+        except ValueError:
+            pass
+
+        return str(value).strip(), 'text'
+
+    @staticmethod
+    def save_dataframe(df, dest_path: str):
+        """Сохраняет DataFrame в .xls с жирными рамками и сеткой ячеек."""
         ext = Path(dest_path).suffix.lower()
         export_df = ExcelCleaner.prepare_for_export(df)
 
-        if ext == '.csv':
-            export_df.to_csv(
-                dest_path,
-                sep=';',
-                encoding='utf-8-sig',
-                index=False,
-                header=False,
-                decimal=',',
-                lineterminator='\r\n',
-                na_rep='',
-            )
-        elif ext == '.xlsx':
-            export_df.to_excel(
-                dest_path,
-                engine='openpyxl',
-                index=False,
-                header=False,
-                na_rep='',
-            )
+        if ext == '.xls':
+            ExcelCleaner.save_xls(export_df, dest_path)
         else:
             raise ValueError(f"Неподдерживаемый формат сохранения: {ext}")
+
+    @staticmethod
+    def save_xls(export_df, dest_path: str):
+        import xlwt
+
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet('Sheet1')
+
+        borders = xlwt.Borders()
+        borders.left = xlwt.Borders.THICK
+        borders.right = xlwt.Borders.THICK
+        borders.top = xlwt.Borders.THICK
+        borders.bottom = xlwt.Borders.THICK
+
+        def _make_style(wrap_text=False, num_format=None):
+            style = xlwt.XFStyle()
+            style.borders = borders
+            alignment = xlwt.Alignment()
+            alignment.horz = xlwt.Alignment.HORZ_CENTER
+            alignment.vert = xlwt.Alignment.VERT_CENTER
+            alignment.wrap = 1 if wrap_text else 0
+            style.alignment = alignment
+            if num_format:
+                style.num_format_str = num_format
+            return style
+
+        int_style = _make_style(num_format='0')
+        decimal_style = _make_style(num_format='0.00')
+        text_style = _make_style()
+        wrap_style = _make_style(wrap_text=True)
+
+        for col_idx, width in enumerate((12, 45, 8, 12, 12)):
+            ws.col(col_idx).width = 256 * width
+
+        for row_idx in range(len(export_df)):
+            for col_idx, col_name in enumerate(export_df.columns):
+                value = export_df.iloc[row_idx, col_idx]
+                cell_value, kind = ExcelCleaner.coerce_to_excel_value(value, col_name)
+
+                if kind == 'empty':
+                    style = wrap_style if col_name == 'Товар' else int_style
+                    ws.write(row_idx, col_idx, '', style)
+                elif kind == 'text':
+                    style = wrap_style if col_name == 'Товар' else text_style
+                    ws.write(row_idx, col_idx, cell_value, style)
+                elif kind == 'int':
+                    ws.write(row_idx, col_idx, cell_value, int_style)
+                else:
+                    ws.write(row_idx, col_idx, cell_value, decimal_style)
+
+        wb.save(dest_path)
 
     @staticmethod
     def build_cleaned_dataframe(file_path: str):
@@ -486,33 +558,6 @@ class ExcelCleaner:
             return True, ''
         except Exception as e:
             return False, f"Ошибка структуры: {str(e)}"
-
-    @staticmethod
-    def apply_formatting(xlsx_path: str):
-        import openpyxl
-        from openpyxl import load_workbook
-        from openpyxl.styles import Alignment, Border, Side
-        wb = load_workbook(xlsx_path)
-        ws = wb.active
-        max_row, max_col = ws.max_row, ws.max_column
-        if max_row == 0 or max_col == 0:
-            wb.save(xlsx_path)
-            return
-        thin = Side(border_style="thin", color="000000")
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
-        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
-            for cell in row:
-                cell.border = border
-                if cell.column == 2:
-                    cell.alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
-                else:
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-        ws.column_dimensions['A'].width = 12
-        ws.column_dimensions['B'].width = 45
-        ws.column_dimensions['C'].width = 8
-        ws.column_dimensions['D'].width = 12
-        ws.column_dimensions['E'].width = 12
-        wb.save(xlsx_path)
 
 
 class ExcelCleanerUI(QMainWindow):
