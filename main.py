@@ -100,25 +100,28 @@ class FileProcessor(QObject):
             try:
                 file_p = Path(file_path)
                 file_name = file_p.name
-                ext = file_p.suffix.lower()
 
-                if ext in ('.xls', '.csv'):
-                    dest_name = file_p.stem + '.xlsx'
-                else:
-                    dest_name = file_name
-
-                dest_path = Path(self.staging_dir) / dest_name
-                success, error_msg = ExcelCleaner.remove_empty_rows_and_columns(str(file_p), str(dest_path))
-                if success:
-                    try:
-                        ExcelCleaner.apply_formatting(str(dest_path))
-                    except Exception:
-                        pass
-
-                if success:
-                    self.file_processed.emit(dest_name, '✅ Обработан')
-                else:
+                # Читаем и чистим исходник один раз, затем сохраняем во все
+                # нужные форматы (по умолчанию .csv и .xlsx).
+                combined, error_msg = ExcelCleaner.build_cleaned_dataframe(str(file_p))
+                if combined is None:
                     self.file_processed.emit(file_name, f'❌ {error_msg}')
+                else:
+                    for fmt in ExcelCleaner.EXPORT_FORMATS:
+                        dest_name = file_p.stem + fmt
+                        dest_path = Path(self.staging_dir) / dest_name
+                        try:
+                            ExcelCleaner.save_dataframe(combined, str(dest_path))
+                            # Форматирование (рамки/ширины) применимо только к
+                            # Excel; к CSV не добавляем, чтобы не плодить метаданные.
+                            if fmt == '.xlsx':
+                                try:
+                                    ExcelCleaner.apply_formatting(str(dest_path))
+                                except Exception:
+                                    pass
+                            self.file_processed.emit(dest_name, '✅ Обработан')
+                        except Exception as e:
+                            self.file_processed.emit(dest_name, f'❌ {str(e)}')
             except Exception as e:
                 self.file_processed.emit(Path(file_path).name, f'❌ {str(e)}')
             done += 1
@@ -136,6 +139,14 @@ class ExcelCleaner:
     }
     TARGET_COLUMNS = ['Артикул', 'Товар', 'Кол-во', 'Цена', 'Сумма']
     FOOTER_KEYWORDS = ['итого', 'итого:', 'в том числе', 'ндс', 'налог']
+    # Колонки, которые при экспорте принудительно приводятся к числу.
+    # Артикул не трогаем: он может содержать буквы и ведущие нули.
+    NUMERIC_EXPORT_COLUMNS = ['Кол-во', 'Цена', 'Сумма']
+    # Форматы итогового файла. По умолчанию создаём СРАЗУ оба варианта,
+    # чтобы можно было импортировать тот, который примет 'Своя технология'
+    # (заранее проверить нет возможности). Оставьте в списке один формат,
+    # когда станет известно, какой именно нужен.
+    EXPORT_FORMATS = ['.csv', '.xlsx']
 
     @staticmethod
     def is_processable_filename(name: str) -> bool:
@@ -338,70 +349,140 @@ class ExcelCleaner:
                 pass
         return df
 
+    # Невидимые символы, которые остаются после копирования из 1С/Excel и
+    # ломают импорт (распознавание чисел): неразрывные пробелы, узкий
+    # неразрывный пробел, символы нулевой ширины, BOM.
+    INVISIBLE_CHARS = ['\u00a0', '\u202f', '\u200b', '\u200c', '\u200d', '\ufeff']
+
+    @staticmethod
+    def prepare_for_export(df):
+        """Готовит DataFrame к сохранению так, чтобы импорт точно увидел числа.
+
+        1) Во ВСЕХ текстовых ячейках удаляет невидимые символы (\\xa0 и пр.)
+           и крайние пробелы (внутренние пробелы в тексте сохраняются).
+        2) Для числовых колонок ('Кол-во', 'Цена', 'Сумма') дополнительно
+           удаляет все пробелы и неразрывные пробелы, приводит значения через
+           pd.to_numeric(errors='coerce') и затем .astype(float) — чтобы тип
+           данных гарантированно был числом (Number), а не текстом.
+        """
+        import pandas as pd
+
+        export_df = df.copy()
+
+        def _strip_invisible(text: str) -> str:
+            for ch in ExcelCleaner.INVISIBLE_CHARS:
+                text = text.replace(ch, '')
+            return text
+
+        # 1) Общая чистка невидимых символов во всех нечисловых колонках.
+        #    Проверяем по «не числовая», а не по dtype == object, чтобы
+        #    работало и в новых версиях pandas (строковый dtype 'str').
+        for col in export_df.columns:
+            if not pd.api.types.is_numeric_dtype(export_df[col]):
+                s = export_df[col].astype(str).map(_strip_invisible)
+                export_df[col] = s.str.strip()
+
+        # 2) Числовые колонки -> настоящий тип float.
+        def _normalize(value):
+            text = _strip_invisible(str(value)).strip()
+            if text in ('', 'nan', 'none', 'None', '<NA>'):
+                return ''
+            # Удаляем обычные пробелы (разделители разрядов).
+            text = text.replace(' ', '')
+            if ',' in text and '.' in text:
+                # И ',' и '.' -> ',' считаем разделителем тысяч.
+                return text.replace(',', '')
+            if ',' in text:
+                # Только ',' -> десятичный разделитель.
+                return text.replace(',', '.')
+            return text
+
+        for col in ExcelCleaner.NUMERIC_EXPORT_COLUMNS:
+            if col in export_df.columns:
+                normalized = export_df[col].map(_normalize)
+                export_df[col] = pd.to_numeric(normalized, errors='coerce').astype(float)
+
+        return export_df
+
+    @staticmethod
+    def save_dataframe(df, dest_path: str):
+        """Сохраняет DataFrame максимально совместимо, через pandas.
+
+        CSV  -> разделитель ';', кодировка 'utf-8-sig', index=False,
+                header=False, десятичный разделитель ',', перевод строки '\\r\\n'.
+        XLSX -> engine='openpyxl', index=False, header=False, без какого-либо
+                форматирования и лишних метаданных.
+        """
+        ext = Path(dest_path).suffix.lower()
+        export_df = ExcelCleaner.prepare_for_export(df)
+
+        if ext == '.csv':
+            export_df.to_csv(
+                dest_path,
+                sep=';',
+                encoding='utf-8-sig',
+                index=False,
+                header=False,
+                decimal=',',
+                lineterminator='\r\n',
+                na_rep='',
+            )
+        elif ext == '.xlsx':
+            export_df.to_excel(
+                dest_path,
+                engine='openpyxl',
+                index=False,
+                header=False,
+                na_rep='',
+            )
+        else:
+            raise ValueError(f"Неподдерживаемый формат сохранения: {ext}")
+
+    @staticmethod
+    def build_cleaned_dataframe(file_path: str):
+        """Читает исходник и возвращает единый очищенный DataFrame.
+
+        Возвращает (df, ''). При неподдерживаемом формате -> (None, текст).
+        Парсинг вынесен отдельно, чтобы прочитать файл один раз и затем
+        сохранить результат сразу в несколько форматов.
+        """
+        import pandas as pd
+        p = Path(file_path)
+        ext = p.suffix.lower()
+
+        frames = []
+        if ext == '.csv':
+            raw = ExcelCleaner.read_csv_file(file_path)
+            raw = raw.fillna('').astype(str)
+            cleaned = ExcelCleaner.clean_dataframe(raw)
+            if not cleaned.empty:
+                frames.append(cleaned)
+        elif ext in ('.xls', '.xlsx'):
+            engine = 'xlrd' if ext == '.xls' else 'openpyxl'
+            sheets = pd.read_excel(file_path, sheet_name=None, header=None, dtype=str, engine=engine)
+            for raw in (sheets or {}).values():
+                if raw is None or raw.empty:
+                    continue
+                raw = raw.fillna('').astype(str)
+                cleaned = ExcelCleaner.clean_dataframe(raw)
+                if not cleaned.empty:
+                    frames.append(cleaned)
+        else:
+            return None, f"Неподдерживаемый формат: {ext}"
+
+        if frames:
+            combined = pd.concat(frames, ignore_index=True)
+        else:
+            combined = pd.DataFrame(columns=ExcelCleaner.TARGET_COLUMNS)
+        return combined, ''
+
     @staticmethod
     def remove_empty_rows_and_columns(file_path: str, dest_path: str) -> tuple[bool, str]:
         try:
-            import pandas as pd
-            import openpyxl
-            p = Path(file_path)
-            ext = p.suffix.lower()
-
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Sheet1"
-            ws.sheet_state = 'visible'
-            if hasattr(ws, 'views') and ws.views.sheetView:
-                ws.views.sheetView[0].showGridLines = True
-
-            if ext == '.csv':
-                raw = ExcelCleaner.read_csv_file(file_path)
-                raw = raw.fillna('').astype(str)
-                cleaned = ExcelCleaner.clean_dataframe(raw)
-
-                # Целевое приведение колонок, чтобы числа писались в Excel как числовые ячейки.
-                cleaned = ExcelCleaner.convert_numeric_columns(cleaned)
-
-                for r_idx, row in enumerate(cleaned.values, 1):
-                    for c_idx, val in enumerate(row, 1):
-                        ws.cell(row=r_idx, column=c_idx, value=val)
-                wb.save(dest_path)
-
-            elif ext in ('.xls', '.xlsx'):
-                engine = 'xlrd' if ext == '.xls' else 'openpyxl'
-                sheets = pd.read_excel(file_path, sheet_name=None, header=None, dtype=str, engine=engine)
-                if not sheets:
-                    wb.save(dest_path)
-                    return True, ''
-
-                first_sheet = True
-                for sheet_name, raw in sheets.items():
-                    if raw is None or raw.empty:
-                        continue
-                    raw = raw.fillna('').astype(str)
-                    cleaned = ExcelCleaner.clean_dataframe(raw)
-
-                    if first_sheet:
-                        current_ws = ws
-                        if sheet_name:
-                            current_ws.title = ExcelCleaner.sanitize_sheet_name(sheet_name)
-                        first_sheet = False
-                    else:
-                        safe_name = ExcelCleaner.sanitize_sheet_name(sheet_name) if sheet_name else f"Sheet_{len(wb.sheetnames)+1}"
-                        current_ws = wb.create_sheet(title=safe_name)
-
-                    current_ws.sheet_state = 'visible'
-                    if hasattr(current_ws, 'views') and current_ws.views.sheetView:
-                        current_ws.views.sheetView[0].showGridLines = True
-
-                    cleaned = ExcelCleaner.convert_numeric_columns(cleaned)
-
-                    for r_idx, row in enumerate(cleaned.values, 1):
-                        for c_idx, val in enumerate(row, 1):
-                            current_ws.cell(row=r_idx, column=c_idx, value=val)
-
-                wb.save(dest_path)
-            else:
-                return False, f"Неподдерживаемый формат: {ext}"
+            combined, error = ExcelCleaner.build_cleaned_dataframe(file_path)
+            if combined is None:
+                return False, error
+            ExcelCleaner.save_dataframe(combined, dest_path)
             return True, ''
         except Exception as e:
             return False, f"Ошибка структуры: {str(e)}"
